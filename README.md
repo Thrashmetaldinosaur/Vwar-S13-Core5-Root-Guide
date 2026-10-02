@@ -34,7 +34,7 @@ This project was developed with extensive assistance from **OpenAI's ChatGPT**.
 
 I performed the actual testing on the hardware, executed the commands, dumped and flashed the device, verified the results, and accepted the risk of modifying my own device.
 
-ChatGPT was used extensively throughout the process to help analyze device and firmware information, inspect the Android/AVB boot chain, interpret command output, troubleshoot ASRClientCore, generate commands and scripts, reason through the rooting method, and help write this documentation.
+ChatGPT was used extensively throughout the process to help analyze device and firmware information, inspect the Android/AVB boot chain, interpret command output, troubleshoot ASRClientCore, generate commands and scripts, reason through the rooting method, develop the optional MTP modification, and help write this documentation.
 
 In other words: **the hardware testing and verification were real, but AI was a major part of the research and reverse-engineering workflow.**
 
@@ -129,7 +129,9 @@ https://android.googlesource.com/platform/external/avb/
 
 # Pre-requisite:
 
-Follow the 4 prong data cable hardware mod to allow the S13 to connect via USB (PDF guide attached to repo). 
+Follow the 4 prong data cable hardware mod to allow the S13 to connect via USB:
+
+### [A13 Cable Modification Guide](./A13%20cable.pdf)
 
 # Step 1 — Identify Your Device
 
@@ -630,6 +632,541 @@ At this point the S13 was successfully rooted.
 
 ---
 
+# Optional — Enable MTP File Transfer + ADB
+
+Once rooted, the S13 can also be configured to provide normal **MTP file transfer and ADB simultaneously over USB**.
+
+This allows the watch to appear in Windows File Explorer like a normal Android device while preserving the ADB connection.
+
+On my tested firmware, the stock USB configuration was effectively:
+
+```text
+RNDIS + ADB
+```
+
+The firmware already contains the pieces required for MTP, including:
+
+```text
+/config/usb_gadget/g1/functions/ffs.mtp
+/config/usb_gadget/g1/functions/ffs.adb
+```
+
+and Android's MTP package:
+
+```text
+com.android.mtp
+```
+
+The problem is that the stock ASR USB configuration does not normally expose them as a working MTP + ADB combination.
+
+The working configuration is:
+
+```text
+MTP + ADB
+```
+
+> [!IMPORTANT]
+> Test the temporary configuration first.
+>
+> Do not install the persistent Magisk module until MTP has been confirmed working on your firmware.
+
+## Why the Normal Android USB Command Isn't Enough
+
+Normally, an Android device might be switched with something such as:
+
+```text
+svc usb setFunctions mtp,adb
+```
+
+That did not work correctly on the tested S13.
+
+The S13 firmware uses:
+
+```text
+sys.usb.configfs=2
+```
+
+during normal operation and has a vendor-specific ASR USB gadget configuration.
+
+The active gadget originally linked:
+
+```text
+rndis.gs4
+ffs.adb
+```
+
+The firmware also provides:
+
+```text
+ffs.mtp
+ffs.ptp
+```
+
+The successful approach was therefore to configure the existing USB gadget directly with:
+
+```text
+ffs.mtp
+ffs.adb
+```
+
+and explicitly start Android's MTP service.
+
+The USB controller on my tested watch was:
+
+```text
+c0900100.udc
+```
+
+## Important: Android's Actual MTP Service
+
+The working Android MTP implementation is:
+
+```text
+com.android.mtp/.MtpService
+```
+
+Do **not** assume `/system/bin/mtpd` is the Android media-transfer server.
+
+It is not the service used for Android MTP file transfer on this firmware.
+
+---
+
+## Step 1 — Create the Temporary MTP Test Script
+
+Make sure the rooted watch is running and ADB works:
+
+```powershell
+.\adb devices
+```
+
+Then create the test script from PowerShell:
+
+```powershell
+@'
+#!/system/bin/sh
+
+LOG=/data/local/tmp/s13_real_mtp.log
+G=/config/usb_gadget/g1
+C=$G/configs/b.1
+
+exec >"$LOG" 2>&1
+
+echo "========== S13 MTP + ADB TEST =========="
+date
+id
+
+UDC=$(cat "$G/UDC" 2>/dev/null)
+[ -z "$UDC" ] && UDC=c0900100.udc
+
+echo "UDC=$UDC"
+
+am force-stop com.android.mtp
+
+echo "=== UNBIND USB ==="
+
+printf '\n' > "$G/UDC"
+
+sleep 2
+
+echo "=== CONFIGURE MTP + ADB ==="
+
+rm -f "$C/function0" "$C/function1" "$C/function2"
+rm -f "$C/f1" "$C/f2" "$C/f3" "$C/f4" "$C/f5"
+
+ln -s "$G/functions/ffs.mtp" "$C/function0"
+ln -s "$G/functions/ffs.adb" "$C/function1"
+
+mkdir -p "$C/strings/0x409"
+echo "mtp_adb" > "$C/strings/0x409/configuration"
+
+echo 0 > "$G/bDeviceClass"
+echo 0 > "$G/bDeviceSubClass"
+echo 0 > "$G/bDeviceProtocol"
+
+[ -e "$G/os_desc/use" ] && echo 0 > "$G/os_desc/use"
+
+echo "=== PREPARE ANDROID MTP ==="
+
+setprop sys.usb.ffs.mtp.ready 0
+
+am broadcast --user 0 \
+    -n com.android.mtp/.MtpReceiver \
+    -a android.hardware.usb.action.USB_STATE \
+    --ez connected true \
+    --ez configured false \
+    --ez mtp true \
+    --ez ptp false \
+    --ez adb true \
+    --ez unlocked true \
+    --ez config_changed true
+
+sleep 2
+
+echo "=== REBIND USB ==="
+
+echo "$UDC" > "$G/UDC"
+
+sleep 4
+
+echo "=== START ANDROID MTP ==="
+
+am broadcast --user 0 \
+    -n com.android.mtp/.MtpReceiver \
+    -a android.hardware.usb.action.USB_STATE \
+    --ez connected true \
+    --ez configured true \
+    --ez mtp true \
+    --ez ptp false \
+    --ez adb true \
+    --ez unlocked true \
+    --ez config_changed false
+
+sleep 2
+
+am start-service --user 0 \
+    -n com.android.mtp/.MtpService \
+    --ez unlocked true
+
+sleep 4
+
+echo "=== ACTIVE FUNCTIONS ==="
+ls -la "$C"
+
+echo "=== MTP SERVICE ==="
+dumpsys activity services com.android.mtp | head -n 60
+
+echo "========== COMPLETE =========="
+date
+'@ | Set-Content "$env:TEMP\s13_real_mtp.sh" -Encoding ascii
+```
+
+Push it to the watch:
+
+```powershell
+.\adb push "$env:TEMP\s13_real_mtp.sh" /data/local/tmp/s13_real_mtp.sh
+
+.\adb shell "su -c 'chmod 755 /data/local/tmp/s13_real_mtp.sh'"
+```
+
+---
+
+## Step 2 — Run the Test Script Detached
+
+This part is important.
+
+The script intentionally **unbinds and rebuilds the USB gadget**.
+
+If you simply execute it synchronously through ADB, the shell can be terminated when USB disappears halfway through the script.
+
+Therefore launch it as a detached root process:
+
+```powershell
+.\adb shell "su -c 'sh /data/local/tmp/s13_real_mtp.sh >/data/local/tmp/s13_real_mtp_launcher.log 2>&1 </dev/null &'"
+```
+
+Wait for the USB gadget to rebuild:
+
+```powershell
+Start-Sleep -Seconds 15
+```
+
+Then restart the PC-side ADB server:
+
+```powershell
+.\adb kill-server
+Start-Sleep -Seconds 2
+.\adb start-server
+.\adb wait-for-device
+```
+
+Verify ADB:
+
+```powershell
+.\adb devices
+```
+
+---
+
+## Step 3 — Verify MTP in Windows
+
+Open:
+
+```text
+File Explorer
+→ This PC
+```
+
+The watch should now appear as an MTP device.
+
+Opening it should expose:
+
+```text
+Internal shared storage
+```
+
+At the same time, ADB should continue working.
+
+You can also verify both Windows devices from PowerShell:
+
+```powershell
+Get-PnpDevice -PresentOnly |
+    Where-Object {
+        $_.InstanceId -match "VID_2ECC" -or
+        $_.FriendlyName -match "MTP|ADB|S13"
+    } |
+    Select-Object Status,Class,FriendlyName,InstanceId
+```
+
+A successful configuration should contain both:
+
+```text
+MTP USB Device
+ADB Interface
+```
+
+You can inspect the test log with:
+
+```powershell
+.\adb shell "cat /data/local/tmp/s13_real_mtp.log"
+```
+
+A working MTP service should report Android starting MTP using:
+
+```text
+/storage/emulated/0
+```
+
+---
+
+# Optional — Make MTP + ADB Persistent
+
+Once the temporary test is confirmed working, a Magisk module can configure MTP + ADB automatically after every boot.
+
+This is systemless and does not require permanently modifying `/system`.
+
+The module will be installed at:
+
+```text
+/data/adb/modules/s13_mtp
+```
+
+## Create the Module
+
+From PowerShell:
+
+```powershell
+$moduleProp = @'
+id=s13_mtp
+name=S13 MTP + ADB Fix
+version=1.0
+versionCode=1
+author=Community
+description=Replaces the stock ASR RNDIS+ADB USB configuration with working MTP+ADB on the S13/Core 5.
+'@
+
+$service = @'
+#!/system/bin/sh
+
+LOG=/data/local/tmp/s13_mtp_boot.log
+G=/config/usb_gadget/g1
+C=$G/configs/b.1
+
+exec >>"$LOG" 2>&1
+
+echo
+echo "========== S13 MTP BOOT FIX =========="
+date
+
+i=0
+while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 180 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+
+sleep 5
+
+i=0
+while [ ! -d "$G/functions/ffs.mtp" ] && [ "$i" -lt 60 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+
+i=0
+while [ ! -d "$G/functions/ffs.adb" ] && [ "$i" -lt 60 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+
+UDC=$(cat "$G/UDC" 2>/dev/null)
+[ -z "$UDC" ] && UDC=c0900100.udc
+
+echo "UDC=$UDC"
+
+am force-stop com.android.mtp
+
+printf '\n' > "$G/UDC"
+
+sleep 2
+
+rm -f "$C/function0" "$C/function1" "$C/function2"
+rm -f "$C/f1" "$C/f2" "$C/f3" "$C/f4" "$C/f5"
+
+ln -s "$G/functions/ffs.mtp" "$C/function0"
+ln -s "$G/functions/ffs.adb" "$C/function1"
+
+mkdir -p "$C/strings/0x409"
+echo "mtp_adb" > "$C/strings/0x409/configuration"
+
+echo 0 > "$G/bDeviceClass"
+echo 0 > "$G/bDeviceSubClass"
+echo 0 > "$G/bDeviceProtocol"
+
+[ -e "$G/os_desc/use" ] && echo 0 > "$G/os_desc/use"
+
+setprop sys.usb.ffs.mtp.ready 0
+
+am broadcast --user 0 \
+    -n com.android.mtp/.MtpReceiver \
+    -a android.hardware.usb.action.USB_STATE \
+    --ez connected true \
+    --ez configured false \
+    --ez mtp true \
+    --ez ptp false \
+    --ez adb true \
+    --ez unlocked true \
+    --ez config_changed true
+
+sleep 2
+
+echo "$UDC" > "$G/UDC"
+
+sleep 4
+
+am broadcast --user 0 \
+    -n com.android.mtp/.MtpReceiver \
+    -a android.hardware.usb.action.USB_STATE \
+    --ez connected true \
+    --ez configured true \
+    --ez mtp true \
+    --ez ptp false \
+    --ez adb true \
+    --ez unlocked true \
+    --ez config_changed false
+
+sleep 2
+
+am start-service --user 0 \
+    -n com.android.mtp/.MtpService \
+    --ez unlocked true
+
+sleep 3
+
+echo "=== FINAL CONFIG ==="
+ls -la "$C"
+
+echo "=== MTP SERVICE ==="
+dumpsys activity services com.android.mtp | head -n 40
+
+echo "========== COMPLETE =========="
+date
+'@
+
+$moduleProp | Set-Content "$env:TEMP\s13_mtp_module.prop" -Encoding ascii
+$service    | Set-Content "$env:TEMP\s13_mtp_service.sh" -Encoding ascii
+```
+
+Push both files:
+
+```powershell
+.\adb push "$env:TEMP\s13_mtp_module.prop" /data/local/tmp/s13_mtp_module.prop
+.\adb push "$env:TEMP\s13_mtp_service.sh" /data/local/tmp/s13_mtp_service.sh
+```
+
+Install the Magisk module:
+
+```powershell
+.\adb shell "su -c 'rm -rf /data/adb/modules/s13_mtp; mkdir -p /data/adb/modules/s13_mtp; cp /data/local/tmp/s13_mtp_module.prop /data/adb/modules/s13_mtp/module.prop; cp /data/local/tmp/s13_mtp_service.sh /data/adb/modules/s13_mtp/service.sh; chmod 644 /data/adb/modules/s13_mtp/module.prop; chmod 755 /data/adb/modules/s13_mtp/service.sh'"
+```
+
+Verify the files:
+
+```powershell
+.\adb shell "su -c 'ls -la /data/adb/modules/s13_mtp; cat /data/adb/modules/s13_mtp/module.prop'"
+```
+
+Then reboot:
+
+```powershell
+.\adb reboot
+```
+
+After Android boots:
+
+```powershell
+.\adb wait-for-device
+Start-Sleep -Seconds 10
+.\adb shell "cat /data/local/tmp/s13_mtp_boot.log"
+```
+
+On the tested watch, Windows automatically enumerates both:
+
+```text
+MTP USB Device
+ADB Interface
+```
+
+and File Explorer exposes the watch's internal shared storage.
+
+The MTP + ADB configuration therefore survives a normal reboot.
+
+---
+
+## Disable or Remove the MTP Module
+
+If the module causes problems, disable it:
+
+```powershell
+.\adb shell "su -c 'touch /data/adb/modules/s13_mtp/disable'"
+.\adb reboot
+```
+
+Once disabled, it can be removed with:
+
+```powershell
+.\adb shell "su -c 'rm -rf /data/adb/modules/s13_mtp'"
+```
+
+---
+
+## Current MTP Limitation — USB Reconnection
+
+The boot-time MTP + ADB configuration is confirmed working.
+
+However, on the tested firmware there is currently one known limitation:
+
+**physically unplugging and reconnecting USB may leave the MTP interface enumerated in Windows without a usable File Explorer session.**
+
+ADB may still work.
+
+This occurs because the Magisk module currently establishes the Android MTP session at boot but does not yet monitor subsequent physical USB reconnection events and restart `MtpService`.
+
+If this happens, rerunning the temporary MTP script restores the working MTP session:
+
+```powershell
+.\adb shell "su -c 'sh /data/local/tmp/s13_real_mtp.sh >/data/local/tmp/s13_real_mtp_launcher.log 2>&1 </dev/null &'"
+
+Start-Sleep -Seconds 15
+
+.\adb kill-server
+Start-Sleep -Seconds 2
+.\adb start-server
+.\adb wait-for-device
+```
+
+Automatic unplug/replug recovery is still being investigated.
+
+---
+
 # Restoring Stock
 
 This is why the stock dump is important.
@@ -762,13 +1299,17 @@ Android: BOOTS
 Magisk: RUNNING
 Superuser: WORKING
 Root UID: 0
+MTP: WORKING
+ADB + MTP: WORKING
 ```
 
 No bootloader unlock was performed.
 
 No global AVB disable was required.
 
-Only `init_boot_a` was modified.
+Only `init_boot_a` was modified for root.
+
+The optional MTP modification is systemless through Magisk.
 
 ---
 
@@ -782,7 +1323,7 @@ Conceptually, the tested firmware looks like:
             Locked Bootloader
                    |
                    v
-               vbmeta_a
+                vbmeta_a
                    |
         +----------+----------+
         |          |          |
@@ -790,7 +1331,7 @@ Conceptually, the tested firmware looks like:
       boot     init_boot   vbmeta_system
                    |
                    v
-           trusted RSA key
+            trusted RSA key
 ```
 
 The stock `vbmeta_a` already trusted the key used to authenticate `init_boot`.
@@ -868,7 +1409,7 @@ Keep at least one copy somewhere other than the computer used to modify the watc
 
 This is documentation of a procedure that worked on **my personally owned device**.
 
-I cannot guarantee that another S13/Core 5 uses identical firmware, partition layouts, AVB keys, or ASR configuration.
+I cannot guarantee that another S13/Core 5 uses identical firmware, partition layouts, AVB keys, ASR configuration, or USB configuration.
 
 Rooting and flashing firmware can make a device unbootable.
 
@@ -889,13 +1430,27 @@ Thanks to:
 - The Android Open Source Project for Android Verified Boot / `avbtool`  
   https://android.googlesource.com/platform/external/avb/
 
-- **OpenAI ChatGPT** for extensive AI-assisted analysis, troubleshooting, reverse-engineering assistance, command generation, AVB analysis, and documentation during this project.
+- **OpenAI ChatGPT** for extensive AI-assisted analysis, troubleshooting, reverse-engineering assistance, command generation, AVB analysis, USB/MTP analysis, and documentation during this project.
 
 ---
 
 ## Status
 
 **Confirmed working on `S13_C29_EN_V1.6_20251121`.**
+
+Confirmed on the tested watch:
+
+```text
+ASR low-level access:       WORKING
+Stock partition dumping:    WORKING
+Magisk root:                WORKING
+Locked-bootloader boot:     WORKING
+ADB:                        WORKING
+MTP file transfer:          WORKING
+MTP + ADB simultaneously:   WORKING
+MTP + ADB after reboot:     WORKING
+MTP after unplug/replug:     MANUAL RESTART CURRENTLY REQUIRED
+```
 
 If you test this on another S13/Core 5 firmware revision, please open an issue with:
 
@@ -908,4 +1463,4 @@ ro.product.device
 ro.product.name
 ```
 
-and, if possible, the output of `avbtool info_image` for your stock `init_boot` and `vbmeta`.****
+and, if possible, the output of `avbtool info_image` for your stock `init_boot` and `vbmeta`.
