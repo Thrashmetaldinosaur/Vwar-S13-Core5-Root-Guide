@@ -127,6 +127,10 @@ https://android.googlesource.com/platform/external/avb/
 
 ---
 
+# Pre-requisite:
+
+Follow the 4 prong data cable hardware mod to allow the S13 to connect via USB (PDF guide attached to repo). 
+
 # Step 1 — Identify Your Device
 
 Enable USB debugging and connect the running watch.
