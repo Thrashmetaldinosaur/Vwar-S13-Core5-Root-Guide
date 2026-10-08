@@ -133,6 +133,19 @@ Follow the 4 prong data cable hardware mod to allow the S13 to connect via USB:
 
 ### [A13 Cable Modification Guide](./A13%20cable.pdf)
 
+And general adb commands
+
+S13 boot modes:
+
+Bootloader / Fastboot:
+.\adb reboot bootloader
+
+Fastbootd:
+.\adb reboot fastboot
+
+Recovery / Factory Reset menu:
+.\adb reboot recovery
+
 # Step 1 — Identify Your Device
 
 Enable USB debugging and connect the running watch.
